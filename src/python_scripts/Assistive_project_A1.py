@@ -23,7 +23,7 @@ timel     = 4.0   # si vols un movej "cronometral" més curt
 # Obrim RoboDK i el projecte
 RDK = Robolink()
 
-# carregar el RDK
+# Intenta carregar el RDK que m’has passat; si no, prova el camí antic del teu repo
 rdk_candidates = [
     "/mnt/data/Assistive_UR5e.rdk",
     os.path.abspath("src/roboDK/Assistive_UR5e.rdk")
@@ -78,8 +78,9 @@ def joints_list_rad(target_item: Item):
     if not target_item.Valid():
         raise ValueError(f"Target no vàlid: {target_item.Name()}")
     j_deg_mat = target_item.Joints()             # Mat 1x6
-    j_deg_list = j_deg_mat.tolist()[0]           # [deg,...]
-    j_rad_list = list(np.radians(j_deg_list))    # [rad,...]
+    j_deg_list = list(np.radians(j_deg_mat)[0])           # [deg,...]
+    j_rad_list = j_deg_list    # [rad,...]
+    print(j_rad_list)
     return j_rad_list
 
 def ur_movej_cmd(joint_list_rad, accel=accel_mss, speed=speed_ms, t=timej, r=blend_r):
@@ -108,8 +109,9 @@ def do_init(sock=None):
         print("Init target not found!")
 
     if sock:
+        print(sock)
         send_ur_script(sock, SET_TCP)
-        send_ur_script(sock, SET_PAYLOAD)
+        #send_ur_script(sock, SET_PAYLOAD)
         jlist = joints_list_rad(Init_target)
         cmd   = ur_movej_cmd(jlist, accel_mss, speed_ms, timel, blend_r)
         send_ur_script(sock, cmd)
@@ -235,13 +237,13 @@ def do_mix_solution(sock=None):
         j_center = joints_list_rad(Mix_solution_target)
 
         # Per l'aproximació, resolem IK amb la pose 'approach'
-        j_appr_mat = robot.SolveIK(approach)
-        if isinstance(j_appr_mat, Mat):
-            j_appr = list(np.radians(j_appr_mat.tolist()[0]))  # assegura rad
-        else:
+        #j_appr_mat = robot.SolveIK(approach)
+        #if isinstance(j_appr_mat, Mat):
+        #    j_appr = list(np.radians(j_appr_mat))  # assegura rad
+        #else:
             # fallback: si no resol, usa el mateix centre
-            j_appr = j_center
-
+        #    j_appr = j_center
+        j_appr = j_center
         send_ur_script(sock, ur_movej_cmd(j_appr))
         send_ur_script(sock, ur_movej_cmd(j_center))
         send_ur_script(sock, ur_movej_cmd(j_appr))
