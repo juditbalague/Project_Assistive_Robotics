@@ -5,25 +5,27 @@ import math
 import numpy as np
 
 from robodk.robolink import *   # API RoboDK
-from robodk.robomath import *   # Funcions útils
+from robodk.robomath import *   # Funcions útils (Pose_2_UR, transl, etc.)
 
 # -----------------------------
 # CONSTANTS (definides abans d'usar-les)
 ROBOT_IP   = '192.168.1.5'
 ROBOT_PORT = 30002
 
-# Paràmetres UR (movej)
-accel_mss = 1.20
-speed_ms  = 0.75
-blend_r   = 0.0
-timej     = 6.0
-timel     = 4.0   # si vols un movej "cronometral" més curt
+# Paràmetres UR (articular) -> rad/s i rad/s^2
+accel_mss = 1.20   # a per movej (rad/s^2)
+speed_ms  = 0.75   # v per movej (rad/s)
+blend_r   = 0.0    # blending a movej/movel (0 = sense blend)
+
+# Durades d’espera després d’enviar moviments
+timej     = 2.0    # espera típica després d’un movej
+timel     = 2.0    # espera típica després d’un movel
 
 # -----------------------------
 # Obrim RoboDK i el projecte
 RDK = Robolink()
 
-# Intenta carregar el RDK que m’has passat; si no, prova el camí antic del teu repo
+# carregar rdk
 rdk_candidates = [
     "/mnt/data/Assistive_UR5e.rdk",
     os.path.abspath("src/roboDK/Assistive_UR5e.rdk")
@@ -42,8 +44,8 @@ base  = RDK.Item("UR5e Base")
 tool  = RDK.Item("Hand")
 
 robot.setPoseFrame(base)
-robot.setPoseTool(tool)
-robot.setSpeed(20)
+robot.setTool(tool)       # coherent amb RoboDK
+robot.setSpeed(20)        # velocitat lineal "per defecte" (mm/s)
 
 # Targets principals
 Init_target          = RDK.Item('Init')
@@ -69,22 +71,38 @@ Adjust_right = RDK.Item('Adjust_right')
 
 # -----------------------------
 # Helpers
+def fmt_list(vals):
+    return "[" + ",".join(f"{v:.6f}" for v in vals) + "]"
+
 def joints_list_rad(target_item: Item):
     """
-    Retorna la llista de juntes en radians a partir d'un Target de RoboDK,
-    exactament com vols: list(np.radians(Target.Joints())[0]).
-    (Ens assegurem que funcioni robust: Mat -> list -> radians)
+    Retorna la llista de juntes en radians a partir d'un Target de RoboDK.
     """
     if not target_item.Valid():
         raise ValueError(f"Target no vàlid: {target_item.Name()}")
-    j_deg_mat = target_item.Joints()             # Mat 1x6
-    j_deg_list = list(np.radians(j_deg_mat)[0])           # [deg,...]
-    j_rad_list = j_deg_list    # [rad,...]
-    print(j_rad_list)
+    j_deg_mat  = target_item.Joints()            # Mat(1x6) en graus
+    j_rad_list = list(np.radians(j_deg_mat)[0])  # -> [rad,...]
     return j_rad_list
 
-def ur_movej_cmd(joint_list_rad, accel=accel_mss, speed=speed_ms, t=timej, r=blend_r):
-    return f"movej({joint_list_rad},{accel:.5f},{speed:.5f},{t:.5f},{r:.4f})"
+def pose_p_from_target(target_item: Item):
+    """
+    Converteix la Pose 4x4 de RoboDK a p[x,y,z,rx,ry,rz] en metres/radians (UR).
+    """
+    pose = target_item.Pose()
+    x,y,z,rx,ry,rz = Pose_2_UR(pose)  # ja en m i rad per UR
+    return [x,y,z,rx,ry,rz]
+
+def ur_movej_cmd(joint_list_rad, accel=accel_mss, speed=speed_ms, r=blend_r):
+    """
+    movej sense t per tal que s'usïn a i v; fem l'espera amb sleep().
+    """
+    return f"movej({fmt_list(joint_list_rad)}, a={accel:.5f}, v={speed:.5f}, r={r:.4f})"
+
+def ur_movel_p_cmd(p_list, accel=0.75, speed=0.25, r=0.0):
+    """
+    movel en espai cartesià amb p[...]; velocitats lineals (m/s, m/s^2).
+    """
+    return f"movel(p{fmt_list(p_list)}, a={accel:.5f}, v={speed:.5f}, r={r:.4f})"
 
 def send_ur_script(sock, command):
     sock.send((command + "\n").encode())
@@ -96,8 +114,8 @@ def connect_ur(ip, port, timeout=2.0):
     return s
 
 # URScript util
-SET_TCP = "set_tcp(p[0.000000, 0.000000, 0.050000, 0.000000, 0.000000, 0.000000])"
-SET_PAYLOAD = "set_payload(1.00, [0,0,0])"  # ajusta si cal
+SET_TCP     = "set_tcp(p[0.000000, 0.000000, 0.050000, 0.000000, 0.000000, 0.000000])"
+SET_PAYLOAD = "set_payload(1.00, [0,0,0])"  # ajusta-ho a la massa real de la mà
 
 # -----------------------------
 # Seqüències (SIM + URScript)
@@ -109,13 +127,11 @@ def do_init(sock=None):
         print("Init target not found!")
 
     if sock:
-        print(sock)
         send_ur_script(sock, SET_TCP)
-        #send_ur_script(sock, SET_PAYLOAD)
+        # send_ur_script(sock, SET_PAYLOAD)  # si cal
         jlist = joints_list_rad(Init_target)
-        cmd   = ur_movej_cmd(jlist, accel_mss, speed_ms, timel, blend_r)
-        send_ur_script(sock, cmd)
-        time.sleep(1.0)
+        send_ur_script(sock, ur_movej_cmd(jlist))
+        time.sleep(timej)
 
 def do_wave(sock=None, cycles=3):
     print("Wave")
@@ -124,7 +140,7 @@ def do_wave(sock=None, cycles=3):
         return
 
     # SIM: entrada més lenta al start
-    robot.setSpeed(20, 100, 10, 20)
+    robot.setSpeed(20, 100, 1, 2)
     robot.MoveJ(Wave_start)
     robot.setSpeed(20, 100, 60, 120)
 
@@ -132,19 +148,31 @@ def do_wave(sock=None, cycles=3):
     if sock:
         # start
         send_ur_script(sock, ur_movej_cmd(joints_list_rad(Wave_start)))
-        time.sleep(0.2)
+        time.sleep(timej)
         # cicles
         for _ in range(cycles):
             send_ur_script(sock, ur_movej_cmd(joints_list_rad(Wave_left)))
+            time.sleep(timej)
             send_ur_script(sock, ur_movej_cmd(joints_list_rad(Wave_right)))
-        # tornar a start
-        send_ur_script(sock, ur_movej_cmd(joints_list_rad(Wave_start)))
+            time.sleep(timej)
+
+        # tornar a start: més lent i sense blend
+        time.sleep(0.5)
+        send_ur_script(sock, ur_movej_cmd(
+            joints_list_rad(Wave_start),
+            accel=0.1,   
+            speed=0.1,   
+            r=0.0
+        ))
+        time.sleep(timej) 
 
     # SIM: tres oscil·lacions
     for _ in range(cycles):
         robot.MoveL(Wave_left)
         robot.MoveL(Wave_right)
+    robot.setSpeed(20, 100, 5, 10)
     robot.MoveJ(Wave_start)
+    robot.setSpeed(20, 100, 60, 120)
 
 def do_press_sanitizer(sock=None):
     print("Press sanitizer")
@@ -164,9 +192,11 @@ def do_press_sanitizer(sock=None):
     # UR
     if sock:
         send_ur_script(sock, ur_movej_cmd(joints_list_rad(App_sanitizer)))
+        time.sleep(timej)
         send_ur_script(sock, ur_movej_cmd(joints_list_rad(Press_sanitizer)))
-        time.sleep(0.5)
+        time.sleep(0.5)  # pressió breu
         send_ur_script(sock, ur_movej_cmd(joints_list_rad(Ret_sanitizer)))
+        time.sleep(timej)
 
 def do_adjust_light(sock=None):
     print("Adjust light")
@@ -185,9 +215,13 @@ def do_adjust_light(sock=None):
     # UR
     if sock:
         send_ur_script(sock, ur_movej_cmd(joints_list_rad(App_light)))
+        time.sleep(timej)
         send_ur_script(sock, ur_movej_cmd(joints_list_rad(Adjust_left)))
+        time.sleep(timej)
         send_ur_script(sock, ur_movej_cmd(joints_list_rad(Adjust_right)))
+        time.sleep(timej)
         send_ur_script(sock, ur_movej_cmd(joints_list_rad(App_light)))
+        time.sleep(timej)
 
 def do_pick_move_drop(sock=None):
     print("Pick/Move/Drop drug")
@@ -197,56 +231,98 @@ def do_pick_move_drop(sock=None):
     if Move_drug_target.Valid():
         robot.MoveL(Move_drug_target, True)
     if Drop_drug_target.Valid():
-        # més controlat
-        robot.setSpeed(5)
+        robot.setSpeed(20,100,5,10)
         robot.MoveL(Drop_drug_target, True)
-        robot.setSpeed(15)
+        robot.setSpeed(20, 100, 5, 10) 
 
     # UR
     if sock:
         if Pick_drug_target.Valid():
             send_ur_script(sock, ur_movej_cmd(joints_list_rad(Pick_drug_target)))
+            time.sleep(timej)
         if Move_drug_target.Valid():
             send_ur_script(sock, ur_movej_cmd(joints_list_rad(Move_drug_target)))
+            time.sleep(timej)
         if Drop_drug_target.Valid():
-            send_ur_script(sock, ur_movej_cmd(joints_list_rad(Drop_drug_target)))
+            send_ur_script(sock, ur_movej_cmd(joints_list_rad(Drop_drug_target), accel=0.1, speed=0.1, r=0.0))
+            time.sleep(timej)
 
 def do_mix_solution(sock=None):
     """
-    UR: farem la posició d'aproximació, centre i sortida amb movej.
-    (La trajectòria circular d’agitació detallada la mantens via RoboDK si la vols,
-     però així el robot real té ordres vàlides per al "core" del moviment.)
+    SIM: agitació circular X-Z al voltant del centre (Mix_solution_target).
+    UR: mateix patró amb movel p[...] i blending suau.
     """
     print("Mix solution")
     if not Mix_solution_target.Valid():
         print("Mix_solution target not found!")
         return
 
+    # --------- SIM (ràpid i fluid amb rounding) ----------
     center_pose = Mix_solution_target.Pose()
-    approach    = center_pose * transl(0, 0, 50)
+    radius_mm = 30.0
+    turns = 3
+    steps = 36
+    total_points = turns * steps
 
-    # SIM (aprox -> centre -> aprox)
-    robot.MoveL(approach, True)
-    robot.MoveL(center_pose, True)
-    robot.MoveL(approach, True)
+    previous_speed = 200
+    robot.setSpeed(20)      # lineal alta per a l’agitació
+    robot.setRounding(10.0)   # mm de blending per suavitzar
 
-    # UR (via IK dels targets: fem servir els joints del Target principal; per l'aproximació,
-    # fem una solució d'IK ràpida amb la pose 'approach' resolta per RoboDK)
+    try:
+        approach = center_pose * transl(0, 0, 50)
+        robot.MoveL(approach, True)
+        robot.MoveL(center_pose, True)
+
+        for i in range(total_points):
+            angle = 2.0 * math.pi * (i / steps)
+            y = radius_mm * math.sin(angle)
+            z = radius_mm * math.cos(angle)
+            new_pose = center_pose * transl(0, y, z)  # X fix (0)
+            robot.MoveL(new_pose, True)
+
+        robot.MoveL(center_pose, True)
+        robot.MoveL(approach, True)
+        print("Mix solution done (SIM, X-Z plane)")
+    except Exception as e:
+        print("Error during Mix_solution() SIM:", e)
+    finally:
+        robot.setRounding(0.0)
+        robot.setSpeed(previous_speed)
+
+    # --------- UR REAL ----------
     if sock:
-        # Obtenim juntes del target centre
-        j_center = joints_list_rad(Mix_solution_target)
+        # Paràmetres d’agitació (m, rad)
+        radius_m = 0.030     # 30 mm
+        turns    = 3
+        steps    = 36
+        a_lin    = 0.75
+        v_lin    = 0.25
+        r_blend  = 0.005     # 5 mm
 
-        # Per l'aproximació, resolem IK amb la pose 'approach'
-        #j_appr_mat = robot.SolveIK(approach)
-        #if isinstance(j_appr_mat, Mat):
-        #    j_appr = list(np.radians(j_appr_mat))  # assegura rad
-        #else:
-            # fallback: si no resol, usa el mateix centre
-        #    j_appr = j_center
-        j_appr = j_center
-        send_ur_script(sock, ur_movej_cmd(j_appr))
-        send_ur_script(sock, ur_movej_cmd(j_center))
-        send_ur_script(sock, ur_movej_cmd(j_appr))
+        # 1) Apropa’t al centre en articular
+        q_center = joints_list_rad(Mix_solution_target)
+        send_ur_script(sock, ur_movej_cmd(q_center, accel_mss, speed_ms, r=0.0))
+        time.sleep(timej)
+
+        # 2) Baixa al centre en cartesià
+        cx, cy, cz, rx, ry, rz = pose_p_from_target(Mix_solution_target)
+        send_ur_script(sock, ur_movel_p_cmd([cx, cy, cz, rx, ry, rz], a_lin, v_lin, r=0.0))
+        time.sleep(timel)
+
+        # 3) Trajecte circular amb blending (punt a punt)
+        total_points = turns * steps
+        for i in range(total_points):
+            ang = 2.0 * math.pi * (i / steps)
+            y   = cy + radius_m * math.sin(ang)
+            z   = cz + radius_m * math.cos(ang)
+            p   = [cx, y, z, rx, ry, rz]
+            send_ur_script(sock, ur_movel_p_cmd(p, a_lin, v_lin, r=r_blend))
+            # sleep curt: el blending ja suavitza i encadena
+            time.sleep(0.02)
+
+        # 4) Torna al centre i espera
+        send_ur_script(sock, ur_movel_p_cmd([cx, cy, cz, rx, ry, rz], a_lin, v_lin, r=0.0))
+        time.sleep(timel)
 
 # -----------------------------
 def main():
@@ -256,7 +332,7 @@ def main():
         sock = connect_ur(ROBOT_IP, ROBOT_PORT)
         print("Connexió UR OK")
         send_ur_script(sock, SET_TCP)
-        send_ur_script(sock, SET_PAYLOAD)
+        send_ur_script(sock, SET_PAYLOAD)  # ajusta payload si cal
     except Exception as e:
         print(f"No s'ha pogut connectar al robot ({ROBOT_IP}:{ROBOT_PORT}). Continuo en simulació. Detall: {e}")
         sock = None
